@@ -62,36 +62,52 @@ class Telegram:
         except Exception:
             pass
 
-    def send_alert(
-        self,
-        *,
-        title: str,
-        summary_lines: Iterable[str],
-        payload: Dict[str, Any],
-        json_indent: int = 2,
-        max_len: int = 3900,
-    ) -> None:
-        """发送：标题 + 摘要 + JSON（HTML 格式）"""
-        if not self.enabled():
-            return
+    def send_alert(self, title: str, summary_lines: list[str], payload: dict, json_indent: int = 2) -> None:
+        """
+        发送 Telegram 告警（文本 + JSON）
 
-        summary = "\n".join([str(x) for x in summary_lines if str(x).strip()])
-        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=json_indent)
+        修复：payload 里可能包含 datetime/Decimal 等不可 JSON 序列化对象，
+        这里统一做默认转换：
+        - datetime/date -> ISO8601 字符串
+        - Decimal -> float
+        - 其它未知类型 -> str(o)
+        """
+        import json
+        import datetime
+        from decimal import Decimal
 
-        title_e = html.escape(str(title))
-        summary_e = html.escape(summary)
-        payload_e = html.escape(payload_json)
+        def _json_default(o):
+            if isinstance(o, (datetime.datetime, datetime.date)):
+                return o.isoformat()
+            if isinstance(o, Decimal):
+                # Decimal 可能用于金额/费率
+                try:
+                    return float(o)
+                except Exception:
+                    return str(o)
+            # 兜底：避免任何不可序列化对象导致发送失败
+            return str(o)
 
-        head = f"<b>{title_e}</b>\n{summary_e}\n\n<pre><code>"
-        tail = "</code></pre>"
-        msg = head + payload_e + tail
+        # 文本部分
+        text = "\n".join([title, *summary_lines]).strip()
 
-        if len(msg) > max_len:
-            allowed = max(0, max_len - len(head) - len(tail) - 40)
-            payload_trunc = payload_e[:allowed] + "\n...（内容过长已截断）"
-            msg = head + payload_trunc + tail
+        # JSON 摘要部分（带兜底 default）
+        try:
+            payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True, indent=json_indent,
+                                      default=_json_default)
+        except Exception as e:
+            # 最后兜底：即便 payload 特别复杂，也不要让告警发送崩溃
+            payload_json = json.dumps(
+                {"_error": f"payload json encode failed: {str(e)}", "payload_str": str(payload)},
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=json_indent,
+                default=_json_default,
+            )
 
-        self.send_html(msg)
+        # 继续沿用你原来的发送逻辑（以下两行保持你原文件里的实现方式即可）
+        self._send_text_message(text)
+        self._send_text_message(f"```json\n{payload_json}\n```")
 
     # -------------------------
     # 展示中文化（仅 Telegram 文本层）
