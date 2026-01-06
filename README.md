@@ -1,116 +1,140 @@
-# 📘 AI 驱动多币种逐仓量化交易系统需求文档 (V8.0 企业级架构版)
+# Alpha-Sniper-V8（B-lite）
 
-**文档版本:** V8.0
-**日期:** 2026-01-06
-**项目代号:** Alpha-Sniper-V8
-**核心目标:** 利用 500 USDT 本金，通过高胜率趋势交易与 AI 优选，实现周盈利 100U - 200U (20% - 40% ROI)。
+本仓库实现 **B-lite 架构**（三服务），用于构建可长期运行、可审计、可观测的多币种逐仓量化交易系统。
 
 ---
 
-## 1. 系统架构与运行时 (System Architecture & Runtime)
+## 架构概览
 
-本版本采用微服务架构思想，确保高可用性、可观测性与自愈能力。
+包含三个服务：
 
-### 1.1 容器化进程管理 (Process Management)
-* **基础镜像:** Python 3.10 (Slim/Alpine)。
-* **进程编排:** 使用 `Supervisor` 在容器内管理多进程，替代单一脚本运行。
-    * **Process A (Strategy Engine):** 核心交易主循环，负责信号计算与下单。
-    * **Process B (API Service):** 提供 Healthcheck、Metrics 和 Admin 接口。
-    * **Process C (Data Syncer):** 独立负责 K 线清洗、指标预计算缓存、历史数据归档。
-* **自愈机制 (Self-Healing):**
-    * `Supervisor` 配置 `autorestart=true`，进程崩溃毫秒级拉起。
-    * `Docker Healthcheck` 每 30s 请求 API 端点，超时自动重启容器。
+- **strategy-engine（策略引擎）**  
+  信号计算 → 风控校验 → 订单执行 → 成交对账 → 审计落库（事件流/快照/交易日志）
 
-### 1.2 监控与告警 (Observability)
-* **Healthcheck:** 暴露 `GET /health` 端点，返回各子进程状态。
-* **Alerting:** 进程重启或容器重启时，通过 Telegram Bot 发送 "⚠️ Critical System Event" 告警。
+- **data-syncer（数据同步）**  
+  K 线同步与补洞 → 清洗标准化 → 指标/特征预计算缓存 → 自动归档（热数据 90 天）
+
+- **api-service（控制面）**  
+  健康检查（汇总）/指标（Prometheus）/管理接口（热配置、停开仓、一键清仓）+ Telegram 告警
 
 ---
 
-## 2. 数据库设计：高性能与审计 (Database Schema)
+## 前置条件
 
-采用 **MariaDB**，针对高频读写、审计溯源进行深度优化。
+你已经具备：
 
-### 2.1 高性能存储 (Performance)
-* **分区表 (Partitioning):**
-    * **Table:** `trade_logs`
-    * **策略:** 按 `timestamp` 进行 RANGE 分区 (按月 `p_202601`, `p_202602`...)。
-    * **目的:** 提升历史业绩查询与回测速度。
-* **预计算缓存 (Caching):**
-    * **Table:** `market_data_cache`
-    * **内容:** 存储预计算好的 ADX, Squeeze Momentum, EMA 等指标。
-    * **策略:** 策略引擎优先读取缓存，减少实时计算 CPU 消耗。
+- 独立部署的 **MariaDB**
+- 独立部署的 **Redis**
 
-### 2.2 审计与事件流 (Auditability)
-* **不可变事件流 (Event Sourcing):**
-    * **Table:** `order_events`
-    * **记录:** 订单全生命周期 (CREATED -> SUBMITTED -> FILLED -> CANCELED)。
-    * **字段:** `event_id`, `order_id`, `type`, `timestamp`, `raw_payload` (交易所原始响应)。
-* **持仓快照 (Snapshots):**
-    * **Table:** `position_snapshots`
-    * **频率:** 每 5 分钟或关键事件触发。
-    * **用途:** 完美复盘持仓过程中的浮盈回撤与保证金变化。
+说明：
 
-### 2.3 自动归档 (Archiving)
-* **策略:** 仅保留最近 90 天的热数据。
-* **任务:** 每日凌晨运行归档任务，将旧数据移动至 `_history` 表。
+- 本项目 **不会安装 MariaDB/Redis**，只会通过环境变量连接你已有的服务。
+- MariaDB 用户需要对目标库具有 **CREATE / ALTER / INDEX / INSERT / UPDATE / SELECT** 等权限（用于自动迁移与运行时写入）。
 
 ---
 
-## 3. 资金管理与风控 (Capital & Risk Management)
+## 配置说明
 
-### 3.1 动态“地板”保证金 (Dynamic Floor Margin)
-* **核心逻辑:** 单笔交易 **Initial Margin (初始保证金)** $\ge$ **50 USDT**。
-* **计算公式:**
-    * `Base_Margin = Equity * 10%`
-    * `Final_Margin = max(50, Base_Margin)`
-    * *AI 增强:* 若 AI Score > 85，系数可放大至 1.2。
-* **风控约束:**
-    * 若 `Final_Margin * 杠杆 * 止损距离% > Total_Equity * 3%`，系统优先**降低杠杆**。
-    * 若杠杆降至 5x 仍无法满足风控，则放弃该单。
+### 1）环境变量文件
 
-### 3.2 强平距离硬约束 (Liquidation Guard)
-* **模式:** **强制逐仓 (Isolated Margin)**。
-* **杠杆范围:** **10x - 20x** (动态调整)。
-* **硬性检查公式:**
-    $$|Entry - Liq\_Price| > 1.5 \times |Entry - Stop\_Loss|$$
-    * *执行:* 下单前预计算。如果不满足，自动降杠杆重算。
+将 `.env.example` 复制为 `.env`，按需填写以下关键项：
 
----
+- `DB_HOST / DB_PORT / DB_NAME / DB_USER / DB_PASSWORD`
+- `REDIS_URL`
+- `EXCHANGE_NAME`（默认 `binance_um`）
+- `BINANCE_API_KEY / BINANCE_API_SECRET / BINANCE_BASE_URL`
+- `SYMBOLS`（例如：`BTCUSDT,ETHUSDT`）
+- `TIMEFRAME`（默认 `15m`）
+- `ENABLE_TRADING`（`true/false`）
+- `PAPER_TRADING`（`true/false`）
+- `ADMIN_BEARER_TOKEN`（api-service 管理接口鉴权）
 
-## 4. 策略核心逻辑 (Strategy Engine)
+### 2）数据库自动迁移（非常重要）
 
-### 4.1 趋势与动量过滤
-1.  **ADX 趋势强度:** `ADX(14) > 25` 且 `+DI > -DI` (做多)。
-2.  **挤压动量 (Squeeze Momentum):**
-    * **Squeeze Release:** 状态由 `On` (挤压) 变为 `Off` (释放)。
-    * **Momentum:** 柱状图由负转正 (做多)。
-3.  **成交量确认:** `Current_Vol > 1.5 * MA(Vol, 5)`。
+所有服务启动时都会自动执行 SQL 迁移（幂等）：
 
-### 4.2 入场模型组合 (15m Timeframe)
-* **Setup A (Trend Pullback):**
-    * 环境: ADX > 25 (强趋势)。
-    * 触发: 回踩 EMA21/55 + 拒绝K线 (Wick) + 吞没形态。
-* **Setup B (Squeeze Breakout):**
-    * 环境: Squeeze Release + Momentum 翻红为绿 + 量能爆发。
+- 用于创建/升级数据库表结构
+- 已执行过的迁移会被记录，重复启动不会重复执行同一迁移文件
 
 ---
 
-## 5. AI 智能大脑 (AI Optimization)
+## 启动方式
 
-* **模型:** `SGDClassifier` (Scikit-learn, 支持增量学习)。
-* **数据源:** `market_data_cache` (特征) + `trade_logs` (标签)。
-* **特征工程:**
-    * `ADX_Value`, `Squeeze_Status` (0/1/2), `Vol_Ratio`, `BTC_Correlation`, `RSI_Slope`。
-* **训练机制:** 每次平仓 (Close Event) 触发一次 `partial_fit` 更新模型权重。
+### 1）构建并启动
 
----
-
-## 6. 管理与交互 (Admin Ops)
-
-### 6.1 Admin Tool (CLI)
-通过 Docker exec 运行管理工具，无需重启容器：
 ```bash
-python admin.py status          # 查看进程与持仓
-python admin.py update_config   # 热修改参数
-python admin.py emergency_exit  # 一键清仓
+docker compose up -d --build
+```
+
+### 2）查看服务日志（示例）
+
+```bash
+docker logs -f asv8_strategy_engine
+docker logs -f asv8_data_syncer
+docker logs -f asv8_api_service
+```
+
+---
+
+## 管理接口（api-service）
+
+### 接口列表
+
+- `GET /health`：查看三服务健康状态（基于心跳/状态汇总）
+- `GET /metrics`：Prometheus 指标输出
+- `POST /admin/update_config`：热更新系统参数（写入 system_config 并审计）
+- `POST /admin/emergency_exit`：一键清仓并停止开仓（写入控制指令，由策略引擎执行）
+- `POST /admin/halt`：停止开仓（不影响已持仓的减仓/平仓）
+- `POST /admin/resume`：恢复开仓
+- `GET /admin/status`：查看权益、持仓、最近订单、风控状态等摘要
+
+### 鉴权方式
+
+所有 `/admin/*` 接口都需要请求头：
+
+```text
+Authorization: Bearer <ADMIN_BEARER_TOKEN>
+```
+
+---
+
+## 数据与审计（核心表）
+
+系统会使用以下表实现审计与可回放：
+
+- `order_events`：订单全生命周期事件流（不可变，含交易所原始回包脱敏存证）
+- `position_snapshots`：持仓快照（每 5 分钟 + 关键事件触发）
+- `trade_logs`：交易日志（用于统计与 AI 训练标签）
+- `market_data`：原始 K 线数据（清洗后落库）
+- `market_data_cache`：预计算特征缓存（ADX/EMA/Squeeze/Vol_Ratio 等）
+- `service_status`：服务心跳与状态
+- `control_commands`：控制指令（HALT/RESUME/EMERGENCY_EXIT/UPDATE_CONFIG）
+- `system_config`：热更新配置
+- `config_audit`：配置变更审计
+- `ai_models`：AI 模型版本与二进制存储
+
+---
+
+## 运行建议
+
+### 1）建议先纸面验证（强烈建议）
+
+首次运行建议：
+
+- `PAPER_TRADING=true`
+- `ENABLE_TRADING=true`
+
+待逻辑与审计链路验证完成后，再切换为实盘。
+
+### 2）风控与自愈说明
+
+- 策略引擎下单前执行硬风控校验：保证金地板、强平距离、风险预算（3%）等
+- 发生连续失败/异常行情/回撤阈值等情况会触发停开仓（HALT），并通过告警通知
+- 服务异常可通过容器重启恢复；数据同步与策略执行隔离（B-lite 的关键优势）
+
+---
+
+## 重要说明
+
+- 本项目重点在“工程可长期运行”：幂等、审计、可观测性、自愈与可回放。
+- 交易有风险，任何策略与系统都不保证盈利。请在可承受风险范围内使用。
