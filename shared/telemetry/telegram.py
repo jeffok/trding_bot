@@ -4,10 +4,10 @@ import datetime
 import json
 import os
 from decimal import Decimal
+from html import escape as html_escape
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
-from html import escape as html_escape
 
 
 class Telegram:
@@ -16,7 +16,7 @@ class Telegram:
         self.chat_id = (chat_id or "").strip()
         self.timeout_seconds = int(timeout_seconds)
 
-        # ✅ 新增：是否发送 JSON 摘要（默认开启）
+        # 是否发送 JSON 摘要（默认开启）
         self.send_json = self._get_bool_env("TELEGRAM_SEND_JSON", default=True)
 
     @staticmethod
@@ -33,6 +33,14 @@ class Telegram:
 
     def enabled(self) -> bool:
         return bool(self.bot_token and self.chat_id)
+
+    # ✅ 兼容旧接口：策略引擎用 telegram.send(...)
+    def send(self, text: str) -> None:
+        self.send_text(text)
+
+    def send_text(self, text: str) -> None:
+        # 纯文本发送（不使用 parse_mode，避免 '_' 等触发 Markdown 解析失败）
+        self._send_message(text, parse_mode=None)
 
     def _post_form(self, url: str, data: Dict[str, Any]) -> bool:
         try:
@@ -66,7 +74,6 @@ class Telegram:
                 "text": part,
                 "disable_web_page_preview": "true",
             }
-            # ✅ 文本默认不使用 Markdown，避免 '_' 导致解析失败
             if parse_mode:
                 payload["parse_mode"] = parse_mode
             self._post_form(url, payload)
@@ -82,17 +89,24 @@ class Telegram:
                 return str(o)
         return str(o)
 
-    def send_alert(self, title: str, summary_lines: List[str], payload: Dict[str, Any], json_indent: int = 2) -> None:
+    def send_alert(
+        self,
+        *,
+        title: str,
+        summary_lines: List[str],
+        payload: Dict[str, Any],
+        json_indent: int = 2,
+    ) -> None:
         if not self.enabled():
             return
 
         summary_lines = summary_lines or []
-        text_msg = "\n".join([title, *summary_lines]).strip()
+        text_msg = "\n".join([str(title), *[str(x) for x in summary_lines if str(x).strip()]]).strip()
 
-        # 1) ✅ 文本：永远发送
+        # 1) 文本永远发送（纯文本）
         self._send_message(text_msg, parse_mode=None)
 
-        # 2) ✅ JSON：可通过环境变量关闭
+        # 2) JSON 摘要可关闭
         if not self.send_json:
             return
 
@@ -117,7 +131,7 @@ class Telegram:
         html_msg = f"<b>JSON 摘要</b>\n<pre>{payload_json_html}</pre>"
         self._send_message(html_msg, parse_mode="HTML")
 
-    def send_alert_zh(self, title: str, summary_kv: Dict[str, Any], payload: Dict[str, Any]) -> None:
+    def send_alert_zh(self, *, title: str, summary_kv: Dict[str, Any], payload: Dict[str, Any]) -> None:
         if not self.enabled():
             return
 
@@ -125,6 +139,11 @@ class Telegram:
         for k, v in (summary_kv or {}).items():
             if isinstance(v, (datetime.datetime, datetime.date)):
                 v2 = v.isoformat()
+            elif isinstance(v, Decimal):
+                try:
+                    v2 = float(v)
+                except Exception:
+                    v2 = str(v)
             else:
                 v2 = v
             lines.append(f"- {k}: {v2}")
