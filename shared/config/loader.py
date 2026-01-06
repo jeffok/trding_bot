@@ -25,7 +25,9 @@ class Settings:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
     exchange: str = os.getenv("EXCHANGE", "paper").lower()
-    exchange_category: str = os.getenv("EXCHANGE_CATEGORY", "spot").lower()
+    exchange_category: str = os.getenv("EXCHANGE_CATEGORY", "linear").lower()
+    futures_leverage: int = int(os.getenv("FUTURES_LEVERAGE", "3"))
+    bybit_position_idx: int = int(os.getenv("BYBIT_POSITION_IDX", "0"))
     symbol: str = os.getenv("SYMBOL", "BTCUSDT").upper()
     interval_minutes: int = int(os.getenv("INTERVAL_MINUTES", "15"))
     strategy_tick_seconds: int = int(os.getenv("STRATEGY_TICK_SECONDS", "900"))
@@ -44,7 +46,7 @@ class Settings:
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    binance_base_url: str = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
+    binance_base_url: str = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com")
     binance_api_key: str = os.getenv("BINANCE_API_KEY", "")
     binance_api_secret: str = os.getenv("BINANCE_API_SECRET", "")
     binance_recv_window: int = int(os.getenv("BINANCE_RECV_WINDOW", "5000"))
