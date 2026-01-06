@@ -29,7 +29,7 @@ services:
 
   api-service:
     build:
-      context: alpha-sniper-v8
+      context: .
       dockerfile: services/api_service/Dockerfile
     env_file: .env
     ports:
@@ -42,7 +42,7 @@ services:
 
   data-syncer:
     build:
-      context: alpha-sniper-v8
+      context: .
       dockerfile: services/data_syncer/Dockerfile
     env_file: .env
     depends_on:
@@ -53,7 +53,7 @@ services:
 
   strategy-engine:
     build:
-      context: alpha-sniper-v8
+      context: .
       dockerfile: services/strategy_engine/Dockerfile
     env_file: .env
     depends_on:
