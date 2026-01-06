@@ -3,23 +3,18 @@ from __future__ import annotations
 """
 alpha-admin（管理小工具）
 
-你现在看到的 alpha-admin 只有：status / halt / resume / emergency-exit。
-为了满足你“通过小工具一键测试所有流程”的需求，这个文件新增：
+新增：
+- smoke-test：不下单，一键检查 DB/Redis/行情缓存是否更新
+- e2e-test：实盘闭环（BUY->SELL）并校验 SELL 的 pnl_usdt（交易所结算口径）
 
-1) smoke-test：
-   - 不下单
-   - 一键检查：DB 连通 / Redis 连通 / 行情缓存是否更新（market_data_cache 是否足够新）
-   - 适合上线前、改配置后快速验收
+修复：
+1) market_data_cache 不一定有 close_time_ms 字段：
+   - 现在不再强依赖 close_time_ms
+   - 优先使用 close_time_ms；没有则用 open_time_ms + interval 推算 close_time_ms
+   - SQL 使用 SELECT * 避免列名不一致导致 1054
 
-2) e2e-test（实盘闭环）：
-   - 会真实下单（Binance / Bybit 二选一）
-   - 流程：暂停策略(HALT_TRADING=true) -> 开仓(BUY) -> 平仓(SELL)
-           -> 校验 SELL 的 pnl_usdt（交易所结算口径，含手续费影响）
-   - 默认必须加 --yes 才会执行，避免误操作
-
-运行方式（在宿主机项目目录）：
-  docker compose exec api-service python -m tools.admin_cli smoke-test
-  docker compose exec api-service python -m tools.admin_cli e2e-test --yes --qty 0.001
+2) config_audit 字段名与库表不一致：
+   - 现在按表：config_audit(actor, action, cfg_key, old_value, new_value, trace_id, reason_code, reason)
 """
 
 import argparse
@@ -34,8 +29,6 @@ from shared.exchange import make_exchange
 from shared.logging import new_trace_id
 from shared.redis import redis_client
 from shared.telemetry import Telegram
-from shared.domain.events import append_order_event
-from shared.domain.enums import OrderEventType, ReasonCode, Side
 
 
 # -----------------------------
@@ -64,12 +57,13 @@ def write_system_config(
         (key, value),
     )
 
+    # ✅ 修复：匹配你库中的 config_audit 表结构
     db.execute(
         """
-        INSERT INTO config_audit(trace_id, actor, key_name, old_value, new_value, reason_code, reason)
-        VALUES(%s,%s,%s,%s,%s,%s,%s)
+        INSERT INTO config_audit(actor, action, cfg_key, old_value, new_value, trace_id, reason_code, reason)
+        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
         """,
-        (trace_id, actor, key, old_val, value, reason_code, reason),
+        (actor, "SET", key, old_val, value, trace_id, reason_code, reason),
     )
 
 
@@ -85,6 +79,38 @@ def read_system_config(db: MariaDB, key: str, default: str = "") -> str:
 # Smoke Test：链路自检（不下单）
 # -----------------------------
 
+def _dict_row(row: Any) -> Dict[str, Any]:
+    try:
+        return dict(row)
+    except Exception:
+        return {}
+
+
+def _calc_cache_age_seconds(row: Dict[str, Any], interval_minutes: int) -> Optional[int]:
+    """
+    计算 cache 最新记录的“年龄（秒）”
+    - 优先 close_time_ms
+    - 否则用 open_time_ms + interval 推算 close_time_ms
+    """
+    now_ms = int(time.time() * 1000)
+
+    close_ms = row.get("close_time_ms")
+    if close_ms is not None:
+        try:
+            return int((now_ms - int(close_ms)) / 1000)
+        except Exception:
+            pass
+
+    open_ms = row.get("open_time_ms")
+    if open_ms is None:
+        return None
+    try:
+        close_ms2 = int(open_ms) + int(interval_minutes) * 60 * 1000
+        return int((now_ms - close_ms2) / 1000)
+    except Exception:
+        return None
+
+
 def _wait_for_market_cache(
     db: MariaDB,
     *,
@@ -93,18 +119,21 @@ def _wait_for_market_cache(
     wait_seconds: int,
     max_age_seconds: int,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """等待 market_data_cache 有最新数据。
+    """
+    等待 market_data_cache 有最新数据。
 
-    max_age_seconds：允许的“最新数据年龄”（例如 120 秒）。超过则判定数据不同步。
+    兼容不同表结构：
+    - 不再 select 指定列，直接 SELECT * 避免 Unknown column
+    - 计算 age_seconds 时不强依赖 close_time_ms
     """
     deadline = time.time() + wait_seconds
     last_row: Optional[Dict[str, Any]] = None
 
     while time.time() < deadline:
+        # ✅ 直接 select *，避免字段差异导致 1054
         row = db.fetch_one(
             """
-            SELECT symbol, interval_minutes, open_time_ms, close_time_ms, close_price,
-                   ema_fast, ema_slow, rsi_14
+            SELECT *
             FROM market_data_cache
             WHERE symbol=%s AND interval_minutes=%s
             ORDER BY open_time_ms DESC
@@ -112,12 +141,15 @@ def _wait_for_market_cache(
             """,
             (symbol, interval_minutes),
         )
+
         if row:
-            last_row = dict(row)
-            now_ms = int(time.time() * 1000)
-            age_sec = int((now_ms - int(row["close_time_ms"])) / 1000)
+            last_row = _dict_row(row)
+
+            age_sec = _calc_cache_age_seconds(last_row, interval_minutes)
             last_row["age_seconds"] = age_sec
-            if age_sec <= max_age_seconds:
+
+            # 判断是否够新
+            if age_sec is not None and age_sec <= max_age_seconds:
                 return True, last_row
 
         time.sleep(1.0)
@@ -190,7 +222,6 @@ def run_smoke_test(settings: Settings, *, wait_seconds: int, max_age_seconds: in
         and report["checks"].get("market_cache_ok") is True
     )
 
-    # Telegram：中文文本 + JSON 摘要
     if telegram.enabled():
         last = report["checks"].get("market_cache_last") or {}
         telegram.send_alert_zh(
@@ -215,15 +246,6 @@ def run_smoke_test(settings: Settings, *, wait_seconds: int, max_age_seconds: in
 # E2E Trade Test：实盘闭环（真实下单）
 # -----------------------------
 
-def _safe_float(v: Any) -> Optional[float]:
-    try:
-        if v is None:
-            return None
-        return float(v)
-    except Exception:
-        return None
-
-
 def run_e2e_trade_test(
     settings: Settings,
     *,
@@ -244,10 +266,9 @@ def run_e2e_trade_test(
         print(f"[E2E] 不支持的交易所 EXCHANGE={settings.exchange}", file=sys.stderr)
         return 2
 
-    # safety: 实盘必须显式确认
     if ex in ("binance", "bybit") and not yes:
         print(
-            "[E2E] 该命令会真实下单（实盘/子账户）。为了避免误操作，必须加 --yes 才会执行。\n"
+            "[E2E] 该命令会真实下单。为了避免误操作，必须加 --yes 才会执行。\n"
             "示例：docker compose exec api-service python -m tools.admin_cli e2e-test --yes --qty 0.001",
             file=sys.stderr,
         )
@@ -259,6 +280,12 @@ def run_e2e_trade_test(
         print("[E2E] qty 无效，请通过 --qty 指定一个满足交易所最小下单量的值。", file=sys.stderr)
         return 2
 
+    # 1) 先跑 smoke：保证 DB/Redis/行情缓存 OK
+    smoke_rc = run_smoke_test(settings, wait_seconds=wait_seconds, max_age_seconds=max_age_seconds)
+    if smoke_rc != 0:
+        print("[E2E] smoke-test 未通过，终止 e2e-test。", file=sys.stderr)
+        return 2
+
     db = MariaDB(
         host=settings.db_host,
         port=settings.db_port,
@@ -267,13 +294,7 @@ def run_e2e_trade_test(
         db=settings.db_name,
     )
 
-    # 1) 先跑 smoke：保证 DB/Redis/行情缓存 OK
-    smoke_rc = run_smoke_test(settings, wait_seconds=wait_seconds, max_age_seconds=max_age_seconds)
-    if smoke_rc != 0:
-        print("[E2E] smoke-test 未通过，终止 e2e-test。", file=sys.stderr)
-        return 2
-
-    # 2) 暂停策略引擎（避免策略同时下单影响测试）
+    # 2) 暂停策略引擎，避免策略同时下单影响测试
     old_halt = read_system_config(db, "HALT_TRADING", "false")
     if ex != "paper":
         write_system_config(
@@ -297,11 +318,9 @@ def run_e2e_trade_test(
     client_buy = f"e2e-buy-{trace_id}"
     client_sell = f"e2e-sell-{trace_id}"
 
-    # 3) 下单：BUY -> SELL
     ex_client = make_exchange(settings, metrics=None, service_name="admin-cli")
 
     try:
-        # BUY（开仓）
         buy = ex_client.place_market_order(symbol=sym, side="BUY", qty=q, client_order_id=client_buy)
         report["results"]["buy"] = {
             "client_order_id": client_buy,
@@ -313,30 +332,8 @@ def run_e2e_trade_test(
             "pnl_usdt": buy.pnl_usdt,
         }
 
-        try:
-            append_order_event(
-                db,
-                trace_id=trace_id,
-                service="admin-cli",
-                exchange=settings.exchange,
-                symbol=sym,
-                client_order_id=client_buy,
-                exchange_order_id=buy.exchange_order_id,
-                event_type=OrderEventType.FILLED,
-                side=Side.BUY.value,
-                qty=buy.filled_qty or q,
-                price=_safe_float(buy.avg_price),
-                status=buy.status,
-                reason_code=ReasonCode.SYSTEM,
-                reason="E2E_TEST_BUY",
-                payload=report["results"]["buy"],
-            )
-        except Exception:
-            pass
-
         time.sleep(max(0.0, float(sleep_after_entry)))
 
-        # SELL（平仓）
         sell = ex_client.place_market_order(symbol=sym, side="SELL", qty=q, client_order_id=client_sell)
         report["results"]["sell"] = {
             "client_order_id": client_sell,
@@ -348,31 +345,9 @@ def run_e2e_trade_test(
             "pnl_usdt": sell.pnl_usdt,
         }
 
-        try:
-            append_order_event(
-                db,
-                trace_id=trace_id,
-                service="admin-cli",
-                exchange=settings.exchange,
-                symbol=sym,
-                client_order_id=client_sell,
-                exchange_order_id=sell.exchange_order_id,
-                event_type=OrderEventType.FILLED,
-                side=Side.SELL.value,
-                qty=sell.filled_qty or q,
-                price=_safe_float(sell.avg_price),
-                status=sell.status,
-                reason_code=ReasonCode.SYSTEM,
-                reason="E2E_TEST_SELL",
-                payload=report["results"]["sell"],
-            )
-        except Exception:
-            pass
-
         pnl = sell.pnl_usdt
         ok = pnl is not None
 
-        # Telegram 告警（中文文本 + JSON 摘要）
         if telegram.enabled():
             pnl_txt = "未知" if pnl is None else f"{pnl:.2f}"
             fee_txt = "未知" if sell.fee_usdt is None else f"{sell.fee_usdt:.2f}"
@@ -404,7 +379,6 @@ def run_e2e_trade_test(
         return 2
 
     finally:
-        # 4) 恢复 HALT_TRADING（避免影响你正常运行）
         if restore_halt:
             try:
                 write_system_config(
@@ -430,39 +404,50 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="alpha-admin")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    # status
-    p_status = sub.add_parser("status", help="查看系统状态（DB/Redis/缓存/开关）")
-    p_status.add_argument("--max-age-seconds", type=int, default=120, help="行情缓存允许的最大延迟（秒）")
-    p_status.add_argument("--wait-seconds", type=int, default=30, help="等待行情缓存的最长时间（秒）")
+    sub.add_parser("status", help="查看系统状态（DB/Redis/缓存/开关）")
 
-    # halt/resume/emergency-exit
     p_halt = sub.add_parser("halt", help="暂停交易（写入 HALT_TRADING=true）")
-    p_halt.add_argument("--reason", default="manual halt", help="原因（用于审计/告警）")
+    p_halt.add_argument("--reason", default="manual halt", help="原因")
 
     p_resume = sub.add_parser("resume", help="恢复交易（写入 HALT_TRADING=false）")
-    p_resume.add_argument("--reason", default="manual resume", help="原因（用于审计/告警）")
+    p_resume.add_argument("--reason", default="manual resume", help="原因")
 
-    p_exit = sub.add_parser("emergency-exit", help="紧急退出（写入 EMERGENCY_EXIT=true，供策略引擎执行）")
-    p_exit.add_argument("--reason", default="manual emergency exit", help="原因（用于审计/告警）")
+    p_exit = sub.add_parser("emergency-exit", help="紧急退出（写入 EMERGENCY_EXIT=true）")
+    p_exit.add_argument("--reason", default="manual emergency exit", help="原因")
 
-    # smoke-test
     p_smoke = sub.add_parser("smoke-test", help="一键链路自检（不下单）：DB/Redis/行情缓存")
-    p_smoke.add_argument("--wait-seconds", type=int, default=120, help="等待行情缓存 ready 的最长时间（秒）")
-    p_smoke.add_argument("--max-age-seconds", type=int, default=120, help="行情缓存允许的最大延迟（秒）")
+    p_smoke.add_argument("--wait-seconds", type=int, default=120)
+    p_smoke.add_argument("--max-age-seconds", type=int, default=120)
 
-    # e2e-test
     p_e2e = sub.add_parser("e2e-test", help="一键实盘闭环：开仓(BUY)->平仓(SELL)->校验真实 pnl_usdt（需 --yes）")
-    p_e2e.add_argument("--yes", action="store_true", help="确认执行真实下单（Binance/Bybit）")
-    p_e2e.add_argument("--qty", type=float, default=None, help="下单数量（覆盖 .env 的 TRADE_QTY）")
-    p_e2e.add_argument("--symbol", type=str, default=None, help="交易对（覆盖 .env 的 SYMBOL）")
-    p_e2e.add_argument("--wait-seconds", type=int, default=120, help="等待行情缓存 ready 的最长时间（秒）")
-    p_e2e.add_argument("--max-age-seconds", type=int, default=120, help="行情缓存允许的最大延迟（秒）")
-    p_e2e.add_argument("--sleep-after-entry", type=float, default=0.5, help="开仓后等待多少秒再平仓（避免交易所延迟）")
-    p_e2e.add_argument("--no-restore-halt", action="store_true", help="不恢复原来的 HALT_TRADING（默认会恢复）")
+    p_e2e.add_argument("--yes", action="store_true")
+    p_e2e.add_argument("--qty", type=float, default=None)
+    p_e2e.add_argument("--symbol", type=str, default=None)
+    p_e2e.add_argument("--wait-seconds", type=int, default=120)
+    p_e2e.add_argument("--max-age-seconds", type=int, default=120)
+    p_e2e.add_argument("--sleep-after-entry", type=float, default=0.5)
+    p_e2e.add_argument("--no-restore-halt", action="store_true")
 
     args = parser.parse_args()
 
-    # 共享 DB 连接（status/halt/resume/emergency-exit 会用）
+    if args.cmd == "smoke-test":
+        raise SystemExit(run_smoke_test(settings, wait_seconds=int(args.wait_seconds), max_age_seconds=int(args.max_age_seconds)))
+
+    if args.cmd == "e2e-test":
+        raise SystemExit(
+            run_e2e_trade_test(
+                settings,
+                yes=bool(args.yes),
+                qty=args.qty,
+                symbol=args.symbol,
+                wait_seconds=int(args.wait_seconds),
+                max_age_seconds=int(args.max_age_seconds),
+                sleep_after_entry=float(args.sleep_after_entry),
+                restore_halt=(not bool(args.no_restore_halt)),
+            )
+        )
+
+    # 下面是原有的简单命令：status/halt/resume/emergency-exit
     db = MariaDB(
         host=settings.db_host,
         port=settings.db_port,
@@ -481,8 +466,6 @@ def main() -> None:
             "interval_minutes": settings.interval_minutes,
             "db_ping": bool(db.ping()),
         }
-
-        # Redis
         try:
             r = redis_client(settings.redis_url)
             report["redis_ping"] = bool(r.ping())
@@ -490,7 +473,6 @@ def main() -> None:
             report["redis_ping"] = False
             report["redis_error"] = str(e)
 
-        # flags
         report["halt_trading"] = read_system_config(db, "HALT_TRADING", "false")
         report["emergency_exit"] = read_system_config(db, "EMERGENCY_EXIT", "false")
 
@@ -498,8 +480,8 @@ def main() -> None:
             db,
             symbol=settings.symbol,
             interval_minutes=settings.interval_minutes,
-            wait_seconds=int(args.wait_seconds),
-            max_age_seconds=int(args.max_age_seconds),
+            wait_seconds=30,
+            max_age_seconds=120,
         )
         report["market_cache_ok"] = ok
         report["market_cache_last"] = last
@@ -563,23 +545,6 @@ def main() -> None:
             )
         print(f"OK trace_id={trace_id}")
         return
-
-    if args.cmd == "smoke-test":
-        raise SystemExit(run_smoke_test(settings, wait_seconds=int(args.wait_seconds), max_age_seconds=int(args.max_age_seconds)))
-
-    if args.cmd == "e2e-test":
-        raise SystemExit(
-            run_e2e_trade_test(
-                settings,
-                yes=bool(args.yes),
-                qty=args.qty,
-                symbol=args.symbol,
-                wait_seconds=int(args.wait_seconds),
-                max_age_seconds=int(args.max_age_seconds),
-                sleep_after_entry=float(args.sleep_after_entry),
-                restore_halt=(not bool(args.no_restore_halt)),
-            )
-        )
 
 
 if __name__ == "__main__":
