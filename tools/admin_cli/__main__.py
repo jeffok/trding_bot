@@ -8,20 +8,26 @@ alpha-admin（管理小工具）
 - e2e-test：实盘闭环（BUY->SELL）并校验 SELL 的 pnl_usdt（交易所结算口径）
 
 修复：
-1) market_data_cache 不一定有 close_time_ms 字段：
-   - 现在不再强依赖 close_time_ms
-   - 优先使用 close_time_ms；没有则用 open_time_ms + interval 推算 close_time_ms
-   - SQL 使用 SELECT * 避免列名不一致导致 1054
+1) market_data_cache 表结构不一致：
+   - 不强依赖 close_time_ms
+   - SQL 用 SELECT * 避免 Unknown column
+   - age_seconds 优先 close_time_ms；否则 open_time_ms + interval 推算
 
-2) config_audit 字段名与库表不一致：
-   - 现在按表：config_audit(actor, action, cfg_key, old_value, new_value, trace_id, reason_code, reason)
+2) config_audit 字段名按现有表：
+   - INSERT config_audit(actor, action, cfg_key, old_value, new_value, trace_id, reason_code, reason)
+
+3) JSON 序列化：
+   - report/payload 里可能有 Decimal / datetime
+   - 所有 json.dumps 都带 default=_json_default
 """
 
 import argparse
+import datetime
 import json
 import sys
 import time
-from typing import Any, Dict, Optional, Tuple
+from decimal import Decimal
+from typing import Any, Dict, List, Optional, Tuple
 
 from shared.config import Settings
 from shared.db import MariaDB
@@ -29,6 +35,20 @@ from shared.exchange import make_exchange
 from shared.logging import new_trace_id
 from shared.redis import redis_client
 from shared.telemetry import Telegram
+
+
+# -----------------------------
+# JSON 序列化兜底（防 Decimal / datetime 崩溃）
+# -----------------------------
+def _json_default(o: Any) -> Any:
+    if isinstance(o, (datetime.datetime, datetime.date)):
+        return o.isoformat()
+    if isinstance(o, Decimal):
+        try:
+            return float(o)
+        except Exception:
+            return str(o)
+    return str(o)
 
 
 # -----------------------------
@@ -57,7 +77,7 @@ def write_system_config(
         (key, value),
     )
 
-    # ✅ 修复：匹配你库中的 config_audit 表结构
+    # ✅ 匹配现有表结构
     db.execute(
         """
         INSERT INTO config_audit(actor, action, cfg_key, old_value, new_value, trace_id, reason_code, reason)
@@ -123,14 +143,13 @@ def _wait_for_market_cache(
     等待 market_data_cache 有最新数据。
 
     兼容不同表结构：
-    - 不再 select 指定列，直接 SELECT * 避免 Unknown column
-    - 计算 age_seconds 时不强依赖 close_time_ms
+    - SELECT * 避免字段差异导致 1054
+    - age_seconds 不强依赖 close_time_ms
     """
     deadline = time.time() + wait_seconds
     last_row: Optional[Dict[str, Any]] = None
 
     while time.time() < deadline:
-        # ✅ 直接 select *，避免字段差异导致 1054
         row = db.fetch_one(
             """
             SELECT *
@@ -144,11 +163,9 @@ def _wait_for_market_cache(
 
         if row:
             last_row = _dict_row(row)
-
             age_sec = _calc_cache_age_seconds(last_row, interval_minutes)
             last_row["age_seconds"] = age_sec
 
-            # 判断是否够新
             if age_sec is not None and age_sec <= max_age_seconds:
                 return True, last_row
 
@@ -222,6 +239,7 @@ def run_smoke_test(settings: Settings, *, wait_seconds: int, max_age_seconds: in
         and report["checks"].get("market_cache_ok") is True
     )
 
+    # Telegram：中文文本 + JSON 摘要（send_alert_zh 内部已兜底 datetime/Decimal）
     if telegram.enabled():
         last = report["checks"].get("market_cache_last") or {}
         telegram.send_alert_zh(
@@ -238,7 +256,8 @@ def run_smoke_test(settings: Settings, *, wait_seconds: int, max_age_seconds: in
             payload=report,
         )
 
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    # ✅ 修复：print 的 json.dumps 也要支持 Decimal/datetime
+    print(json.dumps(report, ensure_ascii=False, indent=2, default=_json_default))
     return 0 if passed else 2
 
 
@@ -364,7 +383,7 @@ def run_e2e_trade_test(
                 payload=report,
             )
 
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=_json_default))
         return 0 if ok else 2
 
     except Exception as e:
@@ -375,7 +394,7 @@ def run_e2e_trade_test(
                 summary_kv={"trace_id": trace_id, "错误": str(e)},
                 payload=report,
             )
-        print(json.dumps(report, ensure_ascii=False, indent=2), file=sys.stderr)
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=_json_default), file=sys.stderr)
         return 2
 
     finally:
@@ -404,7 +423,9 @@ def main() -> None:
     parser = argparse.ArgumentParser(prog="alpha-admin")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("status", help="查看系统状态（DB/Redis/缓存/开关）")
+    p_status = sub.add_parser("status", help="查看系统状态（DB/Redis/缓存/开关）")
+    p_status.add_argument("--max-age-seconds", type=int, default=120)
+    p_status.add_argument("--wait-seconds", type=int, default=30)
 
     p_halt = sub.add_parser("halt", help="暂停交易（写入 HALT_TRADING=true）")
     p_halt.add_argument("--reason", default="manual halt", help="原因")
@@ -419,7 +440,7 @@ def main() -> None:
     p_smoke.add_argument("--wait-seconds", type=int, default=120)
     p_smoke.add_argument("--max-age-seconds", type=int, default=120)
 
-    p_e2e = sub.add_parser("e2e-test", help="一键实盘闭环：开仓(BUY)->平仓(SELL)->校验真实 pnl_usdt（需 --yes）")
+    p_e2e = sub.add_parser("e2e-test", help="一键实盘闭环：BUY->SELL->校验真实 pnl_usdt（需 --yes）")
     p_e2e.add_argument("--yes", action="store_true")
     p_e2e.add_argument("--qty", type=float, default=None)
     p_e2e.add_argument("--symbol", type=str, default=None)
@@ -447,7 +468,7 @@ def main() -> None:
             )
         )
 
-    # 下面是原有的简单命令：status/halt/resume/emergency-exit
+    # 下面是原有简单命令
     db = MariaDB(
         host=settings.db_host,
         port=settings.db_port,
@@ -459,7 +480,7 @@ def main() -> None:
     trace_id = new_trace_id("admin")
 
     if args.cmd == "status":
-        report = {
+        report: Dict[str, Any] = {
             "env": getattr(settings, "env", getattr(settings, "app_env", "")),
             "exchange": settings.exchange,
             "symbol": settings.symbol,
@@ -480,13 +501,13 @@ def main() -> None:
             db,
             symbol=settings.symbol,
             interval_minutes=settings.interval_minutes,
-            wait_seconds=30,
-            max_age_seconds=120,
+            wait_seconds=int(args.wait_seconds),
+            max_age_seconds=int(args.max_age_seconds),
         )
         report["market_cache_ok"] = ok
         report["market_cache_last"] = last
 
-        print(json.dumps(report, ensure_ascii=False, indent=2))
+        print(json.dumps(report, ensure_ascii=False, indent=2, default=_json_default))
         return
 
     if args.cmd == "halt":
