@@ -1,4 +1,3 @@
-
 """Configuration loader.
 
 Design goals:
@@ -19,22 +18,39 @@ from dotenv import load_dotenv
 
 load_dotenv(override=False)
 
+
+def _env_first(*names: str, default: str = "") -> str:
+    """按顺序从多个 env key 取值，取到第一个非空的。"""
+    for n in names:
+        v = os.getenv(n)
+        if v is not None and str(v).strip() != "":
+            return str(v).strip()
+    return default
+
+
 @dataclass(frozen=True)
 class Settings:
-    app_env: str = os.getenv("APP_ENV", "dev")
+    # ✅ 兼容字段：有些地方用 env，有些地方用 app_env
+    # 优先 ENV，其次 APP_ENV
+    env: str = _env_first("ENV", "APP_ENV", default="dev")
+    app_env: str = _env_first("APP_ENV", "ENV", default="dev")
+
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
 
+    # 交易所
     exchange: str = os.getenv("EXCHANGE", "paper").lower()
     exchange_category: str = os.getenv("EXCHANGE_CATEGORY", "linear").lower()
     futures_leverage: int = int(os.getenv("FUTURES_LEVERAGE", "3"))
     bybit_position_idx: int = int(os.getenv("BYBIT_POSITION_IDX", "0"))
     symbol: str = os.getenv("SYMBOL", "BTCUSDT").upper()
+
     interval_minutes: int = int(os.getenv("INTERVAL_MINUTES", "15"))
     strategy_tick_seconds: int = int(os.getenv("STRATEGY_TICK_SECONDS", "900"))
     hard_stop_loss_pct: float = float(os.getenv("HARD_STOP_LOSS_PCT", "0.03"))
 
     admin_token: str = os.getenv("ADMIN_TOKEN", "change_me")
 
+    # DB / Redis（外部）
     db_host: str = os.getenv("DB_HOST", "mariadb")
     db_port: int = int(os.getenv("DB_PORT", "3306"))
     db_user: str = os.getenv("DB_USER", "alpha")
@@ -43,19 +59,23 @@ class Settings:
 
     redis_url: str = os.getenv("REDIS_URL", "redis://redis:6379/0")
 
+    # Telegram
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
+    # Binance USDT-M Futures
     binance_base_url: str = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com")
     binance_api_key: str = os.getenv("BINANCE_API_KEY", "")
     binance_api_secret: str = os.getenv("BINANCE_API_SECRET", "")
     binance_recv_window: int = int(os.getenv("BINANCE_RECV_WINDOW", "5000"))
 
+    # Bybit Linear
     bybit_base_url: str = os.getenv("BYBIT_BASE_URL", "https://api.bybit.com")
     bybit_api_key: str = os.getenv("BYBIT_API_KEY", "")
     bybit_api_secret: str = os.getenv("BYBIT_API_SECRET", "")
     bybit_recv_window: int = int(os.getenv("BYBIT_RECV_WINDOW", "5000"))
 
+    # paper（如果你不用 paper，这些不会影响）
     paper_starting_usdt: float = float(os.getenv("PAPER_STARTING_USDT", "1000"))
     paper_fee_pct: float = float(os.getenv("PAPER_FEE_PCT", "0.0004"))
 
