@@ -1,4 +1,3 @@
-
 -- Alpha-Sniper-V8 (B-lite) - MariaDB schema (MVP)
 -- IMPORTANT:
 -- - All timestamps are stored in UTC.
@@ -134,5 +133,5 @@ CREATE TABLE IF NOT EXISTS ai_models (
   model_name VARCHAR(64) NOT NULL,
   version VARCHAR(64) NOT NULL,
   metrics_json JSON NOT NULL,
-  blob LONGBLOB NULL
+  `blob` LONGBLOB NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
