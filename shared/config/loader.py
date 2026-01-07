@@ -12,7 +12,8 @@ NOTE:
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
@@ -26,6 +27,33 @@ def _env_first(*names: str, default: str = "") -> str:
         if v is not None and str(v).strip() != "":
             return str(v).strip()
     return default
+
+
+def _parse_symbols_env() -> tuple[str, ...]:
+    """Parse SYMBOLS env (comma/space separated). Fallback to SYMBOL.
+
+    Examples:
+      SYMBOLS="BTCUSDT,ETHUSDT" -> ("BTCUSDT","ETHUSDT")
+      SYMBOL="BTCUSDT" -> ("BTCUSDT",)
+    """
+    raw = _env_first("SYMBOLS", default="")
+    if not raw:
+        raw = _env_first("SYMBOL", default="BTCUSDT")
+    # allow comma or whitespace separated
+    parts = []
+    for token in re.split(r"[\s,]+", raw.strip()):
+        t = token.strip().upper()
+        if t:
+            parts.append(t)
+    # de-duplicate while preserving order
+    seen = set()
+    uniq = []
+    for s in parts:
+        if s not in seen:
+            seen.add(s)
+            uniq.append(s)
+    return tuple(uniq) if uniq else ("BTCUSDT",)
+
 
 
 @dataclass(frozen=True)
@@ -43,10 +71,35 @@ class Settings:
     futures_leverage: int = int(os.getenv("FUTURES_LEVERAGE", "3"))
     bybit_position_idx: int = int(os.getenv("BYBIT_POSITION_IDX", "0"))
     symbol: str = os.getenv("SYMBOL", "BTCUSDT").upper()
+    # 多交易对池（优先 SYMBOLS，其次 SYMBOL）
+    symbols: tuple[str, ...] = field(default_factory=_parse_symbols_env)
 
     interval_minutes: int = int(os.getenv("INTERVAL_MINUTES", "15"))
     strategy_tick_seconds: int = int(os.getenv("STRATEGY_TICK_SECONDS", "900"))
     hard_stop_loss_pct: float = float(os.getenv("HARD_STOP_LOSS_PCT", "0.03"))
+
+    # 交易与风控（MVP 默认）
+    max_concurrent_positions: int = int(os.getenv('MAX_CONCURRENT_POSITIONS', '3'))
+    # 每单最小保证金（USDT）- 由策略侧反推 qty；名义价值通常为保证金*杠杆
+    min_order_usdt: float = float(os.getenv('MIN_ORDER_USDT', '50'))
+    # 根据评分自动选择杠杆范围
+    auto_leverage_min: int = int(os.getenv('AUTO_LEVERAGE_MIN', '10'))
+    auto_leverage_max: int = int(os.getenv('AUTO_LEVERAGE_MAX', '20'))
+
+    # Take profit (optional): if enabled, profitable exits are labeled as TAKE_PROFIT
+    take_profit_reason_on_positive_pnl: bool = os.getenv("TAKE_PROFIT_REASON_ON_POSITIVE_PNL", "true").strip().lower() in ("1","true","yes","y")
+
+    # AI (online learning)
+    ai_enabled: bool = os.getenv("AI_ENABLED", "true").strip().lower() in ("1","true","yes","y")
+    ai_weight: float = float(os.getenv("AI_WEIGHT", "0.35"))  # 0..1
+    ai_lr: float = float(os.getenv("AI_LR", "0.05"))
+    ai_l2: float = float(os.getenv("AI_L2", "0.000001"))
+    ai_min_samples: int = int(os.getenv("AI_MIN_SAMPLES", "50"))
+    ai_model_key: str = os.getenv("AI_MODEL_KEY", "AI_MODEL_V1")
+
+    # Drills / tests: run one cycle then exit
+    run_once: bool = os.getenv("RUN_ONCE", "false").strip().lower() in ("1","true","yes","y")
+
 
     admin_token: str = os.getenv("ADMIN_TOKEN", "change_me")
 
@@ -62,6 +115,15 @@ class Settings:
     # Telegram
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
+
+    # Observability / runtime identity
+    # METRICS_PORT=0 means "auto" (service decides default) or disabled if service doesn't expose a metrics port.
+    metrics_port: int = int(os.getenv("METRICS_PORT", "0"))
+    # Optional: force instance id (otherwise service will use hostname:pid)
+    instance_id: str = os.getenv("INSTANCE_ID", "")
+    heartbeat_interval_seconds: int = int(os.getenv("HEARTBEAT_INTERVAL_SECONDS", "30"))
+
 
     # Binance USDT-M Futures
     binance_base_url: str = os.getenv("BINANCE_BASE_URL", "https://fapi.binance.com")

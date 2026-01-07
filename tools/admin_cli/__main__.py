@@ -56,14 +56,14 @@ def _json_default(o: Any) -> Any:
 # -----------------------------
 
 def write_system_config(
-    db: MariaDB,
-    *,
-    actor: str,
-    key: str,
-    value: str,
-    trace_id: str,
-    reason_code: str,
-    reason: str,
+        db: MariaDB,
+        *,
+        actor: str,
+        key: str,
+        value: str,
+        trace_id: str,
+        reason_code: str,
+        reason: str,
 ) -> None:
     """写 system_config，并记录 config_audit（用于审计/回溯）。"""
     old = db.fetch_one("SELECT `value` FROM system_config WHERE `key`=%s", (key,))
@@ -71,8 +71,10 @@ def write_system_config(
 
     db.execute(
         """
-        INSERT INTO system_config(`key`, `value`) VALUES(%s,%s)
-        ON DUPLICATE KEY UPDATE `value`=VALUES(`value`)
+        INSERT INTO system_config(`key`, `value`)
+        VALUES (%s, %s) ON DUPLICATE KEY
+        UPDATE `value`=
+        VALUES (`value`)
         """,
         (key, value),
     )
@@ -81,7 +83,7 @@ def write_system_config(
     db.execute(
         """
         INSERT INTO config_audit(actor, action, cfg_key, old_value, new_value, trace_id, reason_code, reason)
-        VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (actor, "SET", key, old_val, value, trace_id, reason_code, reason),
     )
@@ -98,6 +100,11 @@ def read_system_config(db: MariaDB, key: str, default: str = "") -> str:
 # -----------------------------
 # Smoke Test：链路自检（不下单）
 # -----------------------------
+
+def expected_reason_code(got: str, expected: str) -> None:
+    if got != expected:
+        raise SystemExit(f"ERROR: --reason-code must be '{expected}' (got '{got}')")
+
 
 def _dict_row(row: Any) -> Dict[str, Any]:
     try:
@@ -132,12 +139,12 @@ def _calc_cache_age_seconds(row: Dict[str, Any], interval_minutes: int) -> Optio
 
 
 def _wait_for_market_cache(
-    db: MariaDB,
-    *,
-    symbol: str,
-    interval_minutes: int,
-    wait_seconds: int,
-    max_age_seconds: int,
+        db: MariaDB,
+        *,
+        symbol: str,
+        interval_minutes: int,
+        wait_seconds: int,
+        max_age_seconds: int,
 ) -> Tuple[bool, Dict[str, Any]]:
     """
     等待 market_data_cache 有最新数据。
@@ -154,9 +161,9 @@ def _wait_for_market_cache(
             """
             SELECT *
             FROM market_data_cache
-            WHERE symbol=%s AND interval_minutes=%s
-            ORDER BY open_time_ms DESC
-            LIMIT 1
+            WHERE symbol = %s
+              AND interval_minutes = %s
+            ORDER BY open_time_ms DESC LIMIT 1
             """,
             (symbol, interval_minutes),
         )
@@ -234,9 +241,9 @@ def run_smoke_test(settings: Settings, *, wait_seconds: int, max_age_seconds: in
         report["checks"]["flags_error"] = str(e)
 
     passed = (
-        report["checks"].get("db_ping") is True
-        and report["checks"].get("redis_ping") is True
-        and report["checks"].get("market_cache_ok") is True
+            report["checks"].get("db_ping") is True
+            and report["checks"].get("redis_ping") is True
+            and report["checks"].get("market_cache_ok") is True
     )
 
     # Telegram：中文文本 + JSON 摘要（send_alert_zh 内部已兜底 datetime/Decimal）
@@ -266,15 +273,15 @@ def run_smoke_test(settings: Settings, *, wait_seconds: int, max_age_seconds: in
 # -----------------------------
 
 def run_e2e_trade_test(
-    settings: Settings,
-    *,
-    yes: bool,
-    qty: Optional[float],
-    symbol: Optional[str],
-    wait_seconds: int,
-    max_age_seconds: int,
-    sleep_after_entry: float,
-    restore_halt: bool,
+        settings: Settings,
+        *,
+        yes: bool,
+        qty: Optional[float],
+        symbol: Optional[str],
+        wait_seconds: int,
+        max_age_seconds: int,
+        sleep_after_entry: float,
+        restore_halt: bool,
 ) -> int:
     """实盘闭环测试：BUY -> SELL -> 校验 SELL 的 pnl_usdt（交易所结算口径，含手续费影响）。"""
     trace_id = new_trace_id("e2e")
@@ -318,7 +325,7 @@ def run_e2e_trade_test(
     if ex != "paper":
         write_system_config(
             db,
-            actor="cli",
+            actor=args.by,
             key="HALT_TRADING",
             value="true",
             trace_id=trace_id,
@@ -402,7 +409,7 @@ def run_e2e_trade_test(
             try:
                 write_system_config(
                     db,
-                    actor="cli",
+                    actor=args.by,
                     key="HALT_TRADING",
                     value=str(old_halt),
                     trace_id=trace_id,
@@ -428,13 +435,33 @@ def main() -> None:
     p_status.add_argument("--wait-seconds", type=int, default=30)
 
     p_halt = sub.add_parser("halt", help="暂停交易（写入 HALT_TRADING=true）")
-    p_halt.add_argument("--reason", default="manual halt", help="原因")
+    p_halt.add_argument("--by", required=True, help="操作者/来源（写入审计 actor）")
+    p_halt.add_argument("--reason-code", dest="reason_code", required=True, help="原因代码（建议 ADMIN_HALT）")
+    p_halt.add_argument("--reason", required=True, help="原因说明")
 
     p_resume = sub.add_parser("resume", help="恢复交易（写入 HALT_TRADING=false）")
-    p_resume.add_argument("--reason", default="manual resume", help="原因")
+    p_resume.add_argument("--by", required=True, help="操作者/来源（写入审计 actor）")
+    p_resume.add_argument("--reason-code", dest="reason_code", required=True, help="原因代码（建议 ADMIN_RESUME）")
+    p_resume.add_argument("--reason", required=True, help="原因说明")
 
     p_exit = sub.add_parser("emergency-exit", help="紧急退出（写入 EMERGENCY_EXIT=true）")
-    p_exit.add_argument("--reason", default="manual emergency exit", help="原因")
+    p_exit.add_argument("--by", required=True, help="操作者/来源（写入审计 actor）")
+    p_exit.add_argument("--reason-code", dest="reason_code", required=True, help="原因代码（建议 EMERGENCY_EXIT）")
+    p_exit.add_argument("--reason", required=True, help="原因说明")
+
+    p_set = sub.add_parser("set", help="写入 system_config（等价于 /admin/update_config）")
+    p_set.add_argument("key", type=str, help="配置键")
+    p_set.add_argument("value", type=str, help="配置值")
+    p_set.add_argument("--by", required=True, help="操作者/来源（写入审计 actor）")
+    p_set.add_argument("--reason-code", dest="reason_code", required=True, help="原因代码（建议 ADMIN_UPDATE_CONFIG）")
+    p_set.add_argument("--reason", required=True, help="原因说明")
+
+    p_get = sub.add_parser("get", help="读取 system_config 的值")
+    p_get.add_argument("key", type=str, help="配置键")
+
+    p_list = sub.add_parser("list", help="列出 system_config（可选 prefix 过滤）")
+    p_list.add_argument("--prefix", type=str, default="", help="key 前缀过滤")
+    p_list.add_argument("--limit", type=int, default=200, help="最多返回条数")
 
     p_smoke = sub.add_parser("smoke-test", help="一键链路自检（不下单）：DB/Redis/行情缓存")
     p_smoke.add_argument("--wait-seconds", type=int, default=120)
@@ -451,8 +478,54 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    if args.cmd == "set":
+        expected_reason_code(args.reason_code, "ADMIN_UPDATE_CONFIG")
+        write_system_config(
+            db,
+            actor=args.by,
+            key=args.key,
+            value=args.value,
+            trace_id=trace_id,
+            reason_code=args.reason_code,
+            reason=args.reason,
+        )
+        if telegram.enabled():
+            telegram.send_alert_zh(
+                title="⚙️ 已修改配置",
+                summary_kv={"trace_id": trace_id, "key": args.key, "value": args.value, "原因": args.reason},
+                payload={"trace_id": trace_id, "key": args.key, "value": args.value, "reason_code": args.reason_code,
+                         "reason": args.reason},
+            )
+        print(f"OK trace_id={trace_id}")
+        return
+
+    if args.cmd == "get":
+        row = db.fetch_one("SELECT `value` FROM system_config WHERE `key`=%s", (args.key,))
+        if not row:
+            print("")
+            return
+        print(str(row["value"]))
+        return
+
+    if args.cmd == "list":
+        prefix = (args.prefix or "").strip()
+        limit = int(args.limit or 200)
+        if prefix:
+            rows = db.fetch_all(
+                "SELECT `key`,`value`,updated_at FROM system_config WHERE `key` LIKE %s ORDER BY `key` ASC LIMIT %s",
+                (prefix + "%", limit),
+            )
+        else:
+            rows = db.fetch_all(
+                "SELECT `key`,`value`,updated_at FROM system_config ORDER BY `key` ASC LIMIT %s",
+                (limit,),
+            )
+        for r in rows or []:
+            print(f"{r['key']}={r['value']}  (updated_at={r['updated_at']})")
+        return
     if args.cmd == "smoke-test":
-        raise SystemExit(run_smoke_test(settings, wait_seconds=int(args.wait_seconds), max_age_seconds=int(args.max_age_seconds)))
+        raise SystemExit(
+            run_smoke_test(settings, wait_seconds=int(args.wait_seconds), max_age_seconds=int(args.max_age_seconds)))
 
     if args.cmd == "e2e-test":
         raise SystemExit(
@@ -511,13 +584,14 @@ def main() -> None:
         return
 
     if args.cmd == "halt":
+        expected_reason_code(args.reason_code, "ADMIN_HALT")
         write_system_config(
             db,
-            actor="cli",
+            actor=args.by,
             key="HALT_TRADING",
             value="true",
             trace_id=trace_id,
-            reason_code="ADMIN_HALT",
+            reason_code=args.reason_code,
             reason=args.reason,
         )
         if telegram.enabled():
@@ -530,13 +604,14 @@ def main() -> None:
         return
 
     if args.cmd == "resume":
+        expected_reason_code(args.reason_code, "ADMIN_RESUME")
         write_system_config(
             db,
-            actor="cli",
+            actor=args.by,
             key="HALT_TRADING",
             value="false",
             trace_id=trace_id,
-            reason_code="ADMIN_HALT",
+            reason_code=args.reason_code,
             reason=args.reason,
         )
         if telegram.enabled():
@@ -549,13 +624,14 @@ def main() -> None:
         return
 
     if args.cmd == "emergency-exit":
+        expected_reason_code(args.reason_code, "EMERGENCY_EXIT")
         write_system_config(
             db,
-            actor="cli",
+            actor=args.by,
             key="EMERGENCY_EXIT",
             value="true",
             trace_id=trace_id,
-            reason_code="EMERGENCY_EXIT",
+            reason_code=args.reason_code,
             reason=args.reason,
         )
         if telegram.enabled():

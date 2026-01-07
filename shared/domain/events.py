@@ -73,6 +73,8 @@ def append_order_event(
         db.execute(sql, params)
     except Exception as e:
         msg = str(e).lower()
-        if "duplicate" in msg and "uq_client_order" in msg:
+        # 幂等：同一个 (exchange, symbol, client_order_id, event_type) 只允许写一次。
+        # 兼容历史索引名：uq_client_order（旧）/ uq_client_order_event（新）。
+        if "duplicate" in msg and ("uq_client_order_event" in msg or "uq_client_order" in msg):
             return
         raise

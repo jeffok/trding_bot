@@ -13,6 +13,10 @@ services:
       context: .
       dockerfile: services/data_syncer/Dockerfile
     env_file: .env
+    environment:
+      - METRICS_PORT=9101
+    ports:
+      - "9101:9101"
     restart: unless-stopped
 
   strategy-engine:
@@ -20,4 +24,8 @@ services:
       context: .
       dockerfile: services/strategy_engine/Dockerfile
     env_file: .env
+    environment:
+      - METRICS_PORT=9102
+    ports:
+      - "9102:9102"
     restart: unless-stopped

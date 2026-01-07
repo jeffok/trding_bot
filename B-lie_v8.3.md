@@ -361,3 +361,177 @@ CLI 写操作必须同时写：
 - 止损：触发后事件/日志/告警/交易日志一致
 
 （文档结束）
+---
+
+# 11. 阶段开发建议（Roadmap）
+
+> 目标：以“可上线、可审计、可控、可恢复”为第一优先级；先把工程骨架与关键不变量做对，再逐步增强策略与 AI。
+
+## Phase 0：工程骨架与本地可跑（0.5-1 周）
+- 代码仓库结构与基础脚手架（3 服务 + 公共库）
+- docker-compose 一键启动（MariaDB/Redis 作为外部依赖仅做连接配置）
+- 基础配置系统（env + system_config 读取）与时区规范（TZ=Asia/Hong_Kong，DB 用 UTC）
+- 基础日志框架（结构化日志）与 trace_id 贯穿
+
+交付验收：
+- compose 启动 3 服务，/health 返回 OK（包含版本、时区、DB/Redis 连接状态）
+
+## Phase 1：MVP 闭环（1-2 周）
+重点是“能稳定交易且不重复下单”：
+- data-syncer：15m K 线增量同步 + UNIQUE 去重 + 缺口检测（gap 记录即可）
+- market_data_cache：指标预计算最小集（至少能支撑 Setup B）
+- strategy-engine：15m tick 调度 + 分布式锁 + client_order_id 幂等 + order_events 不可变事件流
+- exchange 接入：exchange_client + exchange_gateway + adaptive_rate_limiter（429/418 退避 + 解析响应头）
+- api-service：/admin halt/resume/emergency_exit/update_config + Bearer Token
+- Telegram：覆盖下单/平仓/止损（含 reason_code/reason/trace_id）
+
+交付验收（对齐 MVP 要求）：
+- 订单事件从 CREATED → SUBMITTED → FILLED/ERROR 全链路完整
+- 重启任一服务不重复：不重复下单、不重复写同一根 K 线、不重复归档同一范围
+- 智能节流生效（具备 429 退避与指标）
+
+## Phase 2：可观测性 + 恢复能力（1-2 周）
+- /metrics（Prometheus）完善：orders_total/latency、rate_limit、data_sync_lag/gap、telegram_send_total
+- service_status 心跳、最近错误摘要、data-sync lag 监控与告警
+- 订单对账（RECONCILED）最小实现：启动时加载未终态订单并拉取状态补齐
+- 归档：archive_audit + history 表迁移（分批事务 + 幂等）
+- Admin CLI 全量落地：status/halt/resume/emergency-exit/set/get/list，写审计与告警一致
+
+交付验收：
+- 能定位“为什么没下单/为什么被风控拒单/为什么被限流”，并能通过 trace_id 回溯
+- 故障场景演练：DB 短暂不可用、交易所 429、服务重启、网络抖动
+
+## Phase 3：策略与 AI 增强（持续迭代）
+- Setup A（EMA 回踩 + 形态）逐步上线（灰度：只打分不交易 → 小仓位 → 全量）
+- AI：SGDClassifier partial_fit 完整流水（trade_logs 写入触发训练，ai_models 版本管理）
+- 风控增强：回撤熔断、连续失败熔断、动态仓位（基于 ai_score）
+- 回测/仿真：统一回放接口，复用 strategy-engine 信号与风控模块
+
+## Phase 4：生产化（可选）
+- 多实例（HA）：分布式锁 + 领导者选举（可选）
+- 灾备：DB 备份策略、migrations 管理、密钥轮换
+- 安全：更严格的 admin 操作审计与 IP 白名单/二次确认（按需要）
+---
+
+# 12. 项目目录与文件命名（建议）
+
+> 目标：三服务共享同一套“领域模型 + 事件/审计 + 交易所网关 + 风控/策略基础库”，减少重复与分叉。
+
+## 12.1 顶层目录（建议）
+```text
+alpha-sniper-v8/
+  README.md
+  docker-compose.yml
+  .env.example
+  pyproject.toml
+  poetry.lock (可选)
+  Makefile (可选)
+  scripts/
+    init_db.sql (可选)
+    wait_for_db.sh
+  migrations/
+    0001_init.sql
+    0002_add_reason_fields.sql
+    0003_archive_history_tables.sql
+  shared/
+    __init__.py
+    config/
+      __init__.py
+      loader.py
+      defaults.py
+      schema.py
+    logging/
+      __init__.py
+      logger.py
+      trace.py
+      sanitize.py
+    db/
+      __init__.py
+      maria.py
+      migrations.py
+      models.py
+      repo.py
+    redis/
+      __init__.py
+      client.py
+      locks.py
+      rate_limit_store.py
+    exchange/
+      __init__.py
+      client.py
+      gateway.py
+      rate_limiter.py
+      errors.py
+    domain/
+      __init__.py
+      enums.py
+      ids.py
+      time.py
+      events.py
+      risk.py
+      strategy.py
+      ai.py
+    telemetry/
+      __init__.py
+      metrics.py
+      telegram.py
+  services/
+    data_syncer/
+      Dockerfile
+      __init__.py
+      main.py
+      scheduler.py
+      syncer.py
+      indicators.py
+      archival.py
+      health.py
+    strategy_engine/
+      Dockerfile
+      __init__.py
+      main.py
+      tick.py
+      signal.py
+      executor.py
+      reconciler.py
+      positions.py
+      health.py
+    api_service/
+      Dockerfile
+      __init__.py
+      main.py
+      routes/
+        __init__.py
+        health.py
+        metrics.py
+        admin.py
+      auth.py
+      health.py
+  tools/
+    admin_cli/
+      __init__.py
+      __main__.py
+      commands/
+        __init__.py
+        status.py
+        halt.py
+        resume.py
+        emergency_exit.py
+        config_get.py
+        config_set.py
+        config_list.py
+  tests/
+    unit/
+    integration/
+```
+
+## 12.2 文件命名与职责映射
+- `shared/exchange/rate_limiter.py`：adaptive_rate_limiter 的核心实现（分组预算 + 429/418 退避 + metrics）  
+- `shared/domain/events.py`：order_events 事件类型、写入约束、reason 字段模型  
+- `services/strategy_engine/reconciler.py`：启动/定时对账未终态订单，补写 RECONCILED（最小实现）  
+- `services/data_syncer/archival.py`：archive_audit + history 表迁移（分批事务、可重试幂等）  
+- `tools/admin_cli/commands/*`：所有写操作都必须带 by/reason_code/reason，并写审计/日志/Telegram（与 /admin 对齐）
+
+## 12.3 DB 迁移文件（建议命名）
+- `0001_init.sql`：建表（schema_migrations、service_status、system_config、config_audit、control_commands、order_events、trade_logs、position_snapshots、market_data、market_data_cache、archive_audit、ai_models 等）  
+- `0002_add_reason_fields.sql`：补齐 trace_id/action/reason_code/reason/actor 等字段（如需）  
+- `0003_archive_history_tables.sql`：创建 *_history 表及必要 UNIQUE/索引

@@ -1,23 +1,57 @@
 from __future__ import annotations
 
 import os
+from datetime import datetime, timezone
+import json
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import PlainTextResponse
+from pydantic import BaseModel, Field
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
 from shared.config import Settings
 from shared.db import MariaDB, migrate
+from shared.redis import redis_client
 from shared.logging import get_logger, new_trace_id
+from shared.domain.time import HK
 from shared.telemetry import Telegram
 
 SERVICE = "api-service"
 VERSION = "0.1.0"
 
 logger = get_logger(SERVICE, os.getenv("LOG_LEVEL", "INFO"))
+# ===== Admin models (V8.3 hard requirement: actor + reason_code + reason) =====
+class AdminMeta(BaseModel):
+    actor: str = Field(..., min_length=1, max_length=64, description="操作人/来源（必须）")
+    reason_code: str = Field(..., min_length=1, max_length=64, description="原因代码（必须）")
+    reason: str = Field(..., min_length=1, max_length=4096, description="原因说明（必须）")
+
+
+class AdminUpdateConfig(AdminMeta):
+    key: str = Field(..., min_length=1, max_length=128)
+    value: str = Field(..., min_length=0, max_length=4096)
+
+
+def _parse_bool(v: Optional[str]) -> bool:
+    if v is None:
+        return False
+    return str(v).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def get_system_config(db: MariaDB, key: str, default: Optional[str] = None) -> Optional[str]:
+    row = db.fetch_one("SELECT `value` FROM system_config WHERE `key`=%s", (key,))
+    return row["value"] if row else default
+
+
+def expected_reason_code(cmd_reason_code: str, expected: str) -> None:
+    # 强制 reason_code 标准化，避免审计数据碎片化
+    if cmd_reason_code != expected:
+        raise HTTPException(status_code=400, detail=f"reason_code must be '{expected}'")
+
 
 
 def tg_alert(
@@ -178,23 +212,106 @@ def write_system_config(
     )
 
 
+@app.get("/admin/status")
+def admin_status(
+    settings: Settings = Depends(get_settings),
+    db: MariaDB = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> Dict[str, Any]:
+    trace_id = new_trace_id("status")
+
+    halt_raw = get_system_config(db, "HALT_TRADING", "false")
+    emergency_raw = get_system_config(db, "EMERGENCY_EXIT", "false")
+
+    # latest heartbeat per service (if any)
+    rows = db.fetch_all(
+        """
+        SELECT service_name, instance_id, last_heartbeat, status_json
+        FROM service_status
+        ORDER BY last_heartbeat DESC
+        """
+    )
+    services: Dict[str, Any] = {}
+    for r in rows or []:
+        name = r["service_name"]
+        if name in services:
+            continue
+        try:
+            status_json = json.loads(r["status_json"]) if isinstance(r["status_json"], str) else r["status_json"]
+        except Exception:
+            status_json = {"raw": r["status_json"]}
+        services[name] = {
+            "instance_id": r["instance_id"],
+            "last_heartbeat": str(r["last_heartbeat"]),
+            "status": status_json,
+        }
+
+    # market data lag per symbol
+    md_rows = db.fetch_all(
+        """
+        SELECT symbol, MAX(open_time_ms) AS last_open_time_ms
+        FROM market_data_cache
+        GROUP BY symbol
+        """
+    )
+    now_ms = int(time.time() * 1000)
+    data_lag: List[Dict[str, Any]] = []
+    for r in md_rows or []:
+        last_ot = int(r["last_open_time_ms"]) if r["last_open_time_ms"] is not None else None
+        lag_ms = (now_ms - last_ot) if last_ot else None
+        data_lag.append({"symbol": r["symbol"], "last_open_time_ms": last_ot, "lag_ms": lag_ms})
+
+    # open positions: latest snapshot per symbol base_qty>0
+    pos_rows = db.fetch_all(
+        """
+        SELECT ps.symbol, ps.base_qty
+        FROM position_snapshots ps
+        JOIN (
+            SELECT symbol, MAX(id) AS mid
+            FROM position_snapshots
+            GROUP BY symbol
+        ) t ON ps.symbol=t.symbol AND ps.id=t.mid
+        """
+    )
+    open_positions = 0
+    positions: List[Dict[str, Any]] = []
+    for r in pos_rows or []:
+        qty = float(r["base_qty"] or 0)
+        positions.append({"symbol": r["symbol"], "base_qty": qty})
+        if qty > 0:
+            open_positions += 1
+
+    return {
+        "ok": True,
+        "trace_id": trace_id,
+        "config": {
+            "HALT_TRADING": _parse_bool(halt_raw),
+            "EMERGENCY_EXIT": _parse_bool(emergency_raw),
+        },
+        "open_positions": open_positions,
+        "positions": positions,
+        "data_lag": data_lag,
+        "services": services,
+    }
+
 @app.post("/admin/halt")
 def admin_halt(
-    payload: Dict[str, Any],
+    cmd: AdminMeta,
     settings: Settings = Depends(get_settings),
     db: MariaDB = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> Dict[str, Any]:
     trace_id = new_trace_id("halt")
-    reason = str(payload.get("reason", "")).strip() or "admin_halt"
+    expected_reason_code(cmd.reason_code, "ADMIN_HALT")
+    reason = cmd.reason
 
     write_system_config(
         db,
-        actor="api",
+        actor=cmd.actor,
         key="HALT_TRADING",
         value="true",
         trace_id=trace_id,
-        reason_code="ADMIN_HALT",
+        reason_code=cmd.reason_code,
         reason=reason,
     )
 
@@ -205,28 +322,29 @@ def admin_halt(
         title="⏸️ 管理操作：暂停交易",
         trace_id=trace_id,
         summary_extra={"原因": reason},
-        payload_extra={"reason_code": "ADMIN_HALT", "key": "HALT_TRADING", "value": "true", "reason": reason},
+        payload_extra={"reason_code": cmd.reason_code, "key": "HALT_TRADING", "value": "true", "reason": reason},
     )
     return {"ok": True, "trace_id": trace_id}
 
 
 @app.post("/admin/resume")
 def admin_resume(
-    payload: Dict[str, Any],
+    cmd: AdminMeta,
     settings: Settings = Depends(get_settings),
     db: MariaDB = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> Dict[str, Any]:
     trace_id = new_trace_id("resume")
-    reason = str(payload.get("reason", "")).strip() or "admin_resume"
+    expected_reason_code(cmd.reason_code, "ADMIN_RESUME")
+    reason = cmd.reason
 
     write_system_config(
         db,
-        actor="api",
+        actor=cmd.actor,
         key="HALT_TRADING",
         value="false",
         trace_id=trace_id,
-        reason_code="ADMIN_HALT",
+        reason_code=cmd.reason_code,
         reason=reason,
     )
 
@@ -237,28 +355,29 @@ def admin_resume(
         title="▶️ 管理操作：恢复交易",
         trace_id=trace_id,
         summary_extra={"原因": reason},
-        payload_extra={"reason_code": "ADMIN_HALT", "key": "HALT_TRADING", "value": "false", "reason": reason},
+        payload_extra={"reason_code": cmd.reason_code, "key": "HALT_TRADING", "value": "false", "reason": reason},
     )
     return {"ok": True, "trace_id": trace_id}
 
 
 @app.post("/admin/emergency_exit")
 def admin_emergency_exit(
-    payload: Dict[str, Any],
+    cmd: AdminMeta,
     settings: Settings = Depends(get_settings),
     db: MariaDB = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> Dict[str, Any]:
     trace_id = new_trace_id("exit")
-    reason = str(payload.get("reason", "")).strip() or "admin_emergency_exit"
+    expected_reason_code(cmd.reason_code, "EMERGENCY_EXIT")
+    reason = cmd.reason
 
     write_system_config(
         db,
-        actor="api",
+        actor=cmd.actor,
         key="EMERGENCY_EXIT",
         value="true",
         trace_id=trace_id,
-        reason_code="EMERGENCY_EXIT",
+        reason_code=cmd.reason_code,
         reason=reason,
     )
 
@@ -269,34 +388,34 @@ def admin_emergency_exit(
         title="🆘 管理操作：紧急退出",
         trace_id=trace_id,
         summary_extra={"原因": reason},
-        payload_extra={"reason_code": "EMERGENCY_EXIT", "key": "EMERGENCY_EXIT", "value": "true", "reason": reason},
+        payload_extra={"reason_code": cmd.reason_code, "key": "EMERGENCY_EXIT", "value": "true", "reason": reason},
     )
     return {"ok": True, "trace_id": trace_id}
 
 
 @app.post("/admin/update_config")
 def admin_update_config(
-    payload: Dict[str, Any],
+    cmd: AdminUpdateConfig,
     settings: Settings = Depends(get_settings),
     db: MariaDB = Depends(get_db),
     _: None = Depends(require_admin),
 ) -> Dict[str, Any]:
     trace_id = new_trace_id("cfg")
-    key = str(payload.get("key", "")).strip()
-    value = str(payload.get("value", "")).strip()
-    reason_code = str(payload.get("reason_code", "")).strip() or "ADMIN_CONFIG"
-    reason = str(payload.get("reason", "")).strip() or "admin_update_config"
+    expected_reason_code(cmd.reason_code, "ADMIN_UPDATE_CONFIG")
+    key = cmd.key.strip()
+    value = cmd.value
+    reason = cmd.reason
 
     if not key:
         raise HTTPException(status_code=400, detail="Missing key")
 
     write_system_config(
         db,
-        actor="api",
+        actor=cmd.actor,
         key=key,
         value=value,
         trace_id=trace_id,
-        reason_code=reason_code,
+        reason_code=cmd.reason_code,
         reason=reason,
     )
 
@@ -307,6 +426,6 @@ def admin_update_config(
         title="⚙️ 管理操作：修改配置",
         trace_id=trace_id,
         summary_extra={"key": key, "value": value, "原因": reason},
-        payload_extra={"reason_code": reason_code, "key": key, "value": value, "reason": reason},
+        payload_extra={"reason_code": cmd.reason_code, "key": key, "value": value, "reason": reason},
     )
     return {"ok": True, "trace_id": trace_id}
