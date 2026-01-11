@@ -32,7 +32,37 @@ def migrate(db: MariaDB, migrations_dir: Path) -> List[str]:
         if version in applied:
             continue
 
-        sql = p.read_text(encoding="utf-8")
+        raw_sql = p.read_text(encoding="utf-8")
+
+        # IMPORTANT:
+        # Migration files may contain comments that include semicolons.
+        # A naive `split(';')` breaks those comments into executable fragments
+        # and can cause SQL syntax errors during startup.
+        #
+        # We implement a lightweight sanitizer:
+        # - remove /* ... */ blocks
+        # - remove full-line `-- ...` comments
+        # - remove inline `-- ...` comments (best-effort)
+        # Then split by semicolon.
+
+        # Remove C-style block comments.
+        sql = re.sub(r"/\*.*?\*/", "", raw_sql, flags=re.DOTALL)
+
+        cleaned_lines = []
+        for line in sql.splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith("--"):
+                continue
+            # Remove inline `-- comment` if present.
+            # MySQL requires a space after `--` for comment, but we treat any `--` as comment starter.
+            if "--" in line:
+                line = line.split("--", 1)[0]
+            if line.strip():
+                cleaned_lines.append(line)
+
+        sql = "\n".join(cleaned_lines)
         statements = [s.strip() for s in sql.split(";") if s.strip()]
         with db.tx() as cur:
             for st in statements:
