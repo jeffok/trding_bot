@@ -179,3 +179,10 @@
 
 ### 配置示例
 - 见 `.env.example`：已新增 lag 告警相关环境变量。
+
+## Iteration 10 Hotfix - 2026-01-11
+
+### 修复
+- 修复 `get_instance_id()` 调用不一致导致 `api-service` 启动时报错：
+  - 兼容 `get_instance_id(default)` 与 `get_instance_id(service, default)` 两种调用方式。
+  - 避免 `TypeError: get_instance_id() takes from 0 to 1 positional arguments but 2 were given`。
